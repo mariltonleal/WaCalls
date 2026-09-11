@@ -225,6 +225,25 @@ func (m *CallManager) EndCall(ctx context.Context, reason core.EndCallReason) er
 	return nil
 }
 
+// AbandonCall ends the call locally without sending a terminate to the peer.
+// Used when another device of our own account answered the call: the call
+// goes on there, we just drop our leg.
+func (m *CallManager) AbandonCall(reason core.EndCallReason) {
+	m.mu.Lock()
+	call := m.currentCall
+	if call == nil || call.IsEnded() {
+		m.mu.Unlock()
+		return
+	}
+	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})
+	m.emitState()
+	m.mu.Unlock()
+	if m.OnEnded != nil {
+		m.OnEnded(call)
+	}
+	m.cleanupMedia()
+}
+
 func (m *CallManager) ownCredJid() string {
 	lid := m.sock.OwnLID()
 	if !lid.IsEmpty() {

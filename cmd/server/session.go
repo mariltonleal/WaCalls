@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -265,6 +266,13 @@ func (s *Session) handleEvent(rawEvt any) {
 		s.onIncomingOffer(ctx, evt)
 	case *events.CallAccept:
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			if call := ac.cm.CurrentCall(); call != nil && call.Direction == core.CallDirectionIncoming && !sameUser(evt.From, call.PeerJid) {
+				// Another device of our own account picked up: the call goes on
+				// there. Drop our leg without signalling the caller.
+				s.log.Info("call answered on another device; dropping our leg", "call_id", call.CallID, "device", evt.From.String())
+				ac.cm.AbandonCall(core.EndCallReason("answered_elsewhere"))
+				break
+			}
 			ac.cm.HandleCallAccept(ctx, wrapCall(evt.From, evt.Data), evt.From)
 		}
 	case *events.CallTransport:
@@ -277,6 +285,13 @@ func (s *Session) handleEvent(rawEvt any) {
 		}
 	case *events.CallReject:
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
+			if call := ac.cm.CurrentCall(); call != nil && !sameUser(evt.From, call.PeerJid) {
+				// A reject from a sibling device of our own account (e.g. a
+				// Meta-hosted / Cloud API device answering "uncallable") only
+				// means that device declined; the call keeps ringing elsewhere.
+				s.log.Info("reject from a sibling device ignored", "call_id", call.CallID, "device", evt.From.String())
+				break
+			}
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
 		}
 	}
@@ -393,6 +408,16 @@ func (s *Session) shutdown() {
 	s.teardownAllCalls()
 	s.detachTrunk()
 	s.client.Disconnect()
+}
+
+// sameUser reports whether jid belongs to the same WhatsApp user as peerJid
+// (ignoring device ids and agent suffixes).
+func sameUser(jid types.JID, peerJid string) bool {
+	peer := peerJid
+	if i := strings.IndexAny(peer, ":@"); i >= 0 {
+		peer = peer[:i]
+	}
+	return peer != "" && jid.User == peer
 }
 
 func mapStatus(state core.CallState) CallStatus {

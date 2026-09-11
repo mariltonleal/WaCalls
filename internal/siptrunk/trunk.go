@@ -101,12 +101,33 @@ func (t *Trunk) Start(ctx context.Context, dialer Dialer) error {
 		"pbx", fmt.Sprintf("%s:%d", t.cfg.PBXHost, t.cfg.PBXPort), "register", t.cfg.Register, "did", t.cfg.DID)
 	if t.cfg.Register {
 		go t.registerLoop(ctx)
+	} else {
+		go func() {
+			<-ctx.Done()
+			_ = t.ua.Close()
+		}()
 	}
-	go func() {
-		<-ctx.Done()
-		_ = t.ua.Close()
-	}()
 	return nil
+}
+
+// register runs one registration cycle. diago's deferred Unregister can
+// panic when the context is cancelled mid-request (seen on shutdown), so
+// the cycle is guarded by recover.
+func (t *Trunk) register(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("registration panicked: %v", r)
+		}
+	}()
+	return t.dg.Register(ctx, t.pbxURI(t.cfg.Username), diago.RegisterOptions{
+		Username: t.cfg.Username,
+		Password: t.cfg.Password,
+		Expiry:   120 * time.Second,
+		OnRegistered: func() {
+			t.registered.Store(true)
+			t.log.Info("registered on pbx", "user", t.cfg.Username)
+		},
+	})
 }
 
 // Registered reports whether the trunk currently holds a registration on the PBX.
@@ -123,16 +144,9 @@ func (t *Trunk) pbxURI(user string) sip.Uri {
 }
 
 func (t *Trunk) registerLoop(ctx context.Context) {
+	defer t.ua.Close()
 	for {
-		err := t.dg.Register(ctx, t.pbxURI(t.cfg.Username), diago.RegisterOptions{
-			Username: t.cfg.Username,
-			Password: t.cfg.Password,
-			Expiry:   120 * time.Second,
-			OnRegistered: func() {
-				t.registered.Store(true)
-				t.log.Info("registered on pbx", "user", t.cfg.Username)
-			},
-		})
+		err := t.register(ctx)
 		t.registered.Store(false)
 		if ctx.Err() != nil {
 			return

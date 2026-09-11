@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"fmt"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
@@ -287,7 +288,17 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 			reason = core.EndCallReason(r)
 		}
 	}
-	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason))
+	attrs := ""
+	if info != nil {
+		attrs = fmt.Sprint(info.InnerNode.Attrs)
+	}
+	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason),
+		"from", wanode.AttrString(node.Attrs, "from"), "tag", func() string {
+			if info != nil {
+				return info.Tag
+			}
+			return ""
+		}(), "attrs", attrs)
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})
 	ended := call
 	m.emitState()
