@@ -36,3 +36,9 @@ Thumbs.db
 *~
 !native/
 !native/*.dll
+
+# SIP trunk mode: local config carries SIP secrets and paired sessions
+trunks.json
+*.db
+*.db-wal
+*.db-shm

@@ -41,6 +41,18 @@ concurrent 1:1 calls** at once — one per browser operator — routed independe
 
 ---
 
+## SIP trunk mode (this fork)
+
+This fork adds a **SIP trunk mode**: each paired WhatsApp number registers on a
+PBX (FreePBX / Asterisk) as a PJSIP trunk. Incoming WhatsApp calls ring on
+extensions, queues and IVRs; extensions dial WhatsApp numbers through an
+outbound route. Audio is G.711 (alaw/ulaw), resampled from/to the 16 kHz MLow
+core. Start the server with `-trunks trunks.json` and open the built-in panel
+(`web/`) to pair numbers and provision trunks.
+
+Full guide (Portuguese): [`docs/TRONCO-SIP.md`](docs/TRONCO-SIP.md).
+Deployment helpers: [`deploy/`](deploy/).
+
 ## Architecture
 
 ```
