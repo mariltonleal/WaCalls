@@ -46,6 +46,9 @@ func newSessionManager(ctx context.Context, container *sqlstore.Container, broke
 // attachTrunkIfConfigured binds a SIP trunk to the session when trunks.json
 // has an entry for its name or id.
 func (m *SessionManager) attachTrunkIfConfigured(s *Session) {
+	if err := m.trunks.Reload(); err != nil {
+		m.log.Warn("trunk config reload failed; using last good copy", "err", err)
+	}
 	cfg := m.trunks.Find(s.name, s.id)
 	if cfg == nil {
 		return
@@ -173,6 +176,9 @@ func (m *SessionManager) Delete(ctx context.Context, id string) error {
 	}
 	s.teardownAllCalls()
 	s.detachTrunk()
+	if err := m.trunks.Remove(s.name, s.id); err != nil {
+		m.log.Warn("trunk config update failed", "session", id, "err", err)
+	}
 	m.unregister(id)
 	_ = m.store.delete(ctx, id)
 	m.broker.emitSessionList(m.infos())

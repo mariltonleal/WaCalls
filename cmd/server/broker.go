@@ -40,6 +40,7 @@ type SessionInfo struct {
 	JID    string `json:"jid"`
 	State  string `json:"state"`
 	Paired bool   `json:"paired"`
+	QR     string `json:"qr,omitempty"` // current pairing code, only while state == "qr"
 	Trunk  *TrunkInfo `json:"trunk,omitempty"`
 }
 

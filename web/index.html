@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WaCalls · Números do WhatsApp</title>
+<style>
+  :root { color-scheme: light; --bg:#f4f6f8; --card:#fff; --ink:#1f2a37; --muted:#667085; --ok:#12805c; --warn:#b54708; --bad:#b42318; --line:#e4e7ec; --accent:#0b5fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:16px; max-width:1200px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:16px; margin:0 0 8px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .pill { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .pill.ok { color:var(--ok); border-color:#abefc6; background:#ecfdf3; }
+  .pill.warn { color:var(--warn); border-color:#fedf89; background:#fffaeb; }
+  .pill.bad { color:var(--bad); border-color:#fecdca; background:#fef3f2; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:8px 0; font-size:14px; }
+  dt { color:var(--muted); } dd { margin:0; word-break:break-all; }
+  code { background:#f2f4f7; padding:1px 5px; border-radius:4px; font-size:13px; }
+  .qr { display:flex; flex-direction:column; align-items:center; gap:8px; padding:8px; background:#fff; border:1px dashed var(--line); border-radius:8px; margin-top:8px; }
+  .qr img { width:220px; height:220px; image-rendering:pixelated; }
+  .qr small { color:var(--muted); }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  button { font:inherit; padding:7px 12px; border-radius:8px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  form.new { display:grid; gap:8px; }
+  input { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:8px; width:100%; }
+  .msg { margin-top:8px; font-size:14px; white-space:pre-wrap; }
+  .msg.err { color:var(--bad); } .msg.ok { color:var(--ok); }
+  .hint { font-size:13px; color:var(--muted); margin-top:6px; }
+  @media (prefers-color-scheme: dark) { :root { color-scheme: dark; --bg:#0f1720; --card:#16212d; --ink:#e6edf3; --muted:#9aa7b5; --line:#2a3947; } code { background:#0f1720; } .qr { background:#fff; } }
+</style>
+</head>
+<body>
+<h1>WaCalls · números do WhatsApp</h1>
+<p class="sub">Cada número é uma sessão do WhatsApp e um tronco SIP no FreePBX. Escaneie o QR com o celular do número (Dispositivos conectados → Conectar dispositivo).</p>
+
+<div class="grid" id="grid"></div>
+
+<div class="grid" style="margin-top:16px">
+  <div class="card">
+    <h2>Novo número</h2>
+    <form class="new" id="newForm">
+      <input id="newName" placeholder="Nome (ex.: Tubras, Verdepack)" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,31}">
+      <input id="newDid" placeholder="Número em E.164 sem + (ex.: 5519987654321)" required pattern="[0-9 ()+-]{8,20}">
+      <button class="primary" type="submit">Criar sessão e tronco</button>
+    </form>
+    <div class="hint">Cria a sessão, reserva a porta SIP, gera a senha e cria o tronco no FreePBX (quando o gancho está configurado). Depois é só escanear o QR no cartão que aparece acima.</div>
+    <div class="msg" id="newMsg"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+const API = 'api/';
+const grid = document.getElementById('grid');
+const lastQR = {};
+let trunks = [];
+
+async function api(path, opts) {
+  const r = await fetch(API + path, Object.assign({ headers: { 'Content-Type': 'application/json', 'X-Client-Id': 'painel' } }, opts || {}));
+  let body = null; try { body = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error((body && body.error) || (r.status + ' ' + r.statusText));
+  return body;
+}
+
+function pill(text, cls) { return `<span class="pill ${cls||''}">${text}</span>`; }
+
+function statePill(s) {
+  if (s.paired && s.state === 'open') return pill('WhatsApp conectado', 'ok');
+  if (s.state === 'qr') return pill('aguardando QR', 'warn');
+  if (s.state === 'connecting') return pill('conectando…', 'warn');
+  return pill('desconectado', 'bad');
+}
+
+function trunkPill(s) {
+  if (!s.trunk || !s.trunk.enabled) return pill('sem tronco');
+  return s.trunk.registered ? pill('tronco registrado no PABX', 'ok') : pill('tronco SEM registro', 'bad');
+}
+
+function qrBlock(s) {
+  if (s.state !== 'qr' || !s.qr) return '';
+  return `<div class="qr"><div id="qr-${s.id}"></div><small>Escaneie agora: o código troca a cada ~20 s.</small></div>`;
+}
+
+function render(sessions) {
+  const html = sessions.map(s => {
+    const t = trunks.find(x => x.session.toLowerCase() === s.name.toLowerCase());
+    const phone = s.jid ? s.jid.split(':')[0].split('@')[0] : '';
+    return `<div class="card" data-id="${s.id}">
+      <h2>${s.name} ${statePill(s)}</h2>
+      <div>${trunkPill(s)}</div>
+      <dl>
+        ${phone ? `<dt>Número</dt><dd>+${phone}</dd>` : ''}
+        ${t ? `<dt>Tronco FreePBX</dt><dd><code>${t.username}</code> · DID <code>${t.did}</code> · porta ${t.local_port}</dd>` : ''}
+        ${t ? `<dt>Senha do tronco</dt><dd><code>${t.password}</code></dd>` : ''}
+      </dl>
+      ${qrBlock(s)}
+      <div class="row">
+        ${s.state !== 'qr' && !(s.paired && s.state === 'open') ? `<button data-act="pair">Gerar QR</button>` : ''}
+        ${s.paired && s.state === 'open' ? `<button data-act="logout">Desconectar WhatsApp</button>` : ''}
+        <button class="danger" data-act="delete">Remover</button>
+      </div>
+      <div class="msg" id="msg-${s.id}"></div>
+    </div>`;
+  }).join('');
+  // Trunks configured in trunks.json that have no session yet (e.g. after a restart
+  // dropped an unpaired session): offer to (re)create the session.
+  const orphan = trunks.filter(t => !sessions.some(s => s.name.toLowerCase() === t.session.toLowerCase()));
+  const orphanHtml = orphan.map(t => `<div class="card" data-name="${t.session}">
+      <h2>${t.session} ${pill('sem sessão', 'warn')}</h2>
+      <dl><dt>Tronco FreePBX</dt><dd><code>${t.username}</code> · DID <code>${t.did}</code> · porta ${t.local_port}</dd></dl>
+      <div class="row"><button class="primary" data-act="create">Criar sessão e gerar QR</button></div>
+      <div class="msg" id="msg-${t.session}"></div>
+    </div>`).join('');
+  grid.innerHTML = (html + orphanHtml) || '<div class="card">Nenhum número cadastrado ainda.</div>';
+  for (const s of sessions) {
+    if (s.state === 'qr' && s.qr) {
+      const el = document.getElementById('qr-' + s.id);
+      if (el) { el.innerHTML = ''; new QRCode(el, { text: s.qr, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.L }); }
+    }
+  }
+}
+
+grid.addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-act]'); if (!b) return;
+  const card = b.closest('.card'); const id = card.dataset.id; const msg = document.getElementById('msg-' + (id || card.dataset.name));
+  b.disabled = true;
+  try {
+    if (b.dataset.act === 'create') await api('sessions', { method: 'POST', body: JSON.stringify({ name: card.dataset.name }) });
+    if (b.dataset.act === 'pair') await api(`sessions/${id}/pair`, { method: 'POST' });
+    if (b.dataset.act === 'logout') await api(`sessions/${id}/logout`, { method: 'POST' });
+    if (b.dataset.act === 'delete') {
+      if (!confirm('Remover esta sessão e o tronco? O número é desvinculado do WhatsApp.')) { b.disabled = false; return; }
+      await api(`sessions/${id}`, { method: 'DELETE' });
+    }
+    await refresh();
+  } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; b.disabled = false; }
+});
+
+document.getElementById('newForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const msg = document.getElementById('newMsg'); msg.className = 'msg'; msg.textContent = 'Criando…';
+  try {
+    const r = await api('trunks', { method: 'POST', body: JSON.stringify({ name: document.getElementById('newName').value.trim(), did: document.getElementById('newDid').value.trim() }) });
+    let text = `Sessão e tronco criados. No FreePBX o tronco deve se chamar "${r.trunk.username}" com a senha ${r.trunk.password}.`;
+    if (r.hook_output) text += `\n\nFreePBX: ${r.hook_output}`;
+    if (r.hook_error) text += `\n\nFalha ao criar no FreePBX: ${r.hook_error}`;
+    msg.className = 'msg ' + (r.hook_error ? 'err' : 'ok'); msg.textContent = text;
+    ev.target.reset();
+    await refresh();
+  } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+});
+
+async function refresh() {
+  try {
+    const [s, t] = await Promise.all([api('sessions'), api('trunks').catch(() => ({ trunks: [] }))]);
+    trunks = t.trunks || [];
+    const sessions = s.sessions || [];
+    // Only re-render when something changed, so buttons/selection don't flicker.
+    const key = JSON.stringify(sessions) + JSON.stringify(trunks);
+    if (key !== refresh.last) { refresh.last = key; render(sessions); }
+  } catch (e) { grid.innerHTML = `<div class="card msg err">Sem contato com o WaCalls: ${e.message}</div>`; }
+}
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

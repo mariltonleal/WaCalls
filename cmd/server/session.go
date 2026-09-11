@@ -335,6 +335,9 @@ func (s *Session) info() SessionInfo {
 		jid = id.String()
 	}
 	info := SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	if a.State == "qr" {
+		info.QR = a.QR
+	}
 	if s.trunk != nil {
 		info.Trunk = &TrunkInfo{Enabled: true, Registered: s.trunk.Registered()}
 	}

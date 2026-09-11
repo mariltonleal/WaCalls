@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -28,6 +30,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("GET /api/trunks", s.handleTrunkList)
+	mux.HandleFunc("POST /api/trunks", s.handleTrunkCreate)
 
 	if s.staticDir != "" {
 		if _, err := os.Stat(s.staticDir); err == nil {
@@ -266,6 +270,63 @@ func (s *server) doEndCall(sess *Session, w http.ResponseWriter, r *http.Request
 	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonUserEnded))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTrunkList returns the configured SIP trunks (internal panel: the
+// password is included so the matching PBX trunk can be created).
+func (s *server) handleTrunkList(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"file":   s.sessions.trunks.Path(),
+		"trunks": s.sessions.trunks.List(),
+	})
+}
+
+// handleTrunkCreate adds a trunk + session in one go: {"name","did"}.
+// When trunk_create_hook is configured it is run with <name> <password> <did>
+// so the PBX side can be provisioned automatically.
+func (s *server) handleTrunkCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+		DID  string `json:"did"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	for _, info := range s.sessions.infos() {
+		if strings.EqualFold(info.Name, strings.TrimSpace(body.Name)) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a session with this name already exists"})
+			return
+		}
+	}
+	tc, err := s.sessions.trunks.Add(body.Name, body.DID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	resp := map[string]any{"trunk": tc}
+
+	if hook := s.sessions.trunks.TrunkCreateHook; hook != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, hook, tc.Session, tc.Password, tc.DID).CombinedOutput()
+		resp["hook_output"] = strings.TrimSpace(string(out))
+		if err != nil {
+			resp["hook_error"] = err.Error()
+			s.log.Error("trunk create hook failed", "trunk", tc.Session, "err", err, "output", string(out))
+		} else {
+			s.log.Info("trunk create hook ok", "trunk", tc.Session)
+		}
+	}
+
+	id, err := s.sessions.Create(tc.Session)
+	if err != nil {
+		resp["error"] = "trunk saved but session create failed: " + err.Error()
+		writeJSON(w, http.StatusInternalServerError, resp)
+		return
+	}
+	resp["session_id"] = id
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func normalizePhone(p string) string {

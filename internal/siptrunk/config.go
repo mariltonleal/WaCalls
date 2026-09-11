@@ -14,10 +14,14 @@
 package siptrunk
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // TrunkConfig describes one SIP trunk bound to one WaCalls session.
@@ -73,7 +77,15 @@ type Config struct {
 	RTPPortStart int `json:"rtp_port_start"`
 	RTPPortEnd   int `json:"rtp_port_end"`
 
+	// TrunkCreateHook, when set, is a command run after a trunk is added
+	// through the API, with arguments: <name> <password> <did>. Use it to
+	// create the matching trunk on the PBX automatically.
+	TrunkCreateHook string `json:"trunk_create_hook,omitempty"`
+
 	Trunks []TrunkConfig `json:"trunks"`
+
+	mu   sync.Mutex `json:"-"`
+	path string
 }
 
 // Load reads and validates a trunk configuration file. An empty path yields
@@ -93,7 +105,158 @@ func Load(path string) (*Config, error) {
 	if err := cfg.applyDefaults(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	cfg.path = path
 	return cfg, nil
+}
+
+// Path returns the file this configuration was loaded from ("" when none).
+func (c *Config) Path() string {
+	if c == nil {
+		return ""
+	}
+	return c.path
+}
+
+// Reload re-reads the configuration file so edits made by hand apply to
+// sessions created afterwards. A configuration without a file is a no-op.
+func (c *Config) Reload() error {
+	if c == nil || c.path == "" {
+		return nil
+	}
+	fresh, err := Load(c.path)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.RTPPortStart, c.RTPPortEnd = fresh.RTPPortStart, fresh.RTPPortEnd
+	c.TrunkCreateHook = fresh.TrunkCreateHook
+	c.Trunks = fresh.Trunks
+	c.mu.Unlock()
+	return nil
+}
+
+// Save writes the configuration back to its file (mode 0600, atomically).
+func (c *Config) Save() error {
+	if c.path == "" {
+		return fmt.Errorf("trunk configuration file not set (start with -trunks)")
+	}
+	c.mu.Lock()
+	data, err := json.MarshalIndent(c, "", "  ")
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
+}
+
+// List returns a copy of the configured trunks.
+func (c *Config) List() []TrunkConfig {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]TrunkConfig, len(c.Trunks))
+	copy(out, c.Trunks)
+	return out
+}
+
+var trunkNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{1,31}$`)
+
+// Add creates a trunk for a new session: next free local port, random
+// password, username = name (FreePBX names the auth user after the trunk,
+// so the PBX trunk must be created with exactly this name). It persists
+// the file and returns the resulting entry.
+func (c *Config) Add(name, did string) (*TrunkConfig, error) {
+	if c == nil || c.path == "" {
+		return nil, fmt.Errorf("trunk configuration file not set (start with -trunks)")
+	}
+	name = strings.TrimSpace(name)
+	if !trunkNameRe.MatchString(name) {
+		return nil, fmt.Errorf("invalid name %q: use 2-32 letters, digits, - or _", name)
+	}
+	did = digitsOnly(did)
+	if len(did) < 8 || len(did) > 15 {
+		return nil, fmt.Errorf("invalid did %q: use the number in E.164 without +, e.g. 5519987654321", did)
+	}
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+	password := base64.RawURLEncoding.EncodeToString(raw)
+
+	c.mu.Lock()
+	port := 5070
+	for _, t := range c.Trunks {
+		if strings.EqualFold(t.Session, name) {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("trunk %q already exists", name)
+		}
+		if t.LocalIP == "127.0.0.1" && t.LocalPort >= port {
+			port = t.LocalPort + 1
+		}
+	}
+	tc := TrunkConfig{
+		Session:    name,
+		LocalIP:    "127.0.0.1",
+		LocalPort:  port,
+		Username:   name,
+		Password:   password,
+		Register:   true,
+		DID:        did,
+		CallerName: "WhatsApp " + name,
+	}
+	c.Trunks = append(c.Trunks, tc)
+	if err := c.applyDefaults(); err != nil {
+		c.Trunks = c.Trunks[:len(c.Trunks)-1]
+		c.mu.Unlock()
+		return nil, err
+	}
+	added := c.Trunks[len(c.Trunks)-1]
+	c.mu.Unlock()
+
+	if err := c.Save(); err != nil {
+		return nil, err
+	}
+	return &added, nil
+}
+
+// Remove drops the trunk of a session (by name or id) and persists the file.
+// Removing a trunk that does not exist is not an error.
+func (c *Config) Remove(sessionName, sessionID string) error {
+	if c == nil || c.path == "" {
+		return nil
+	}
+	c.mu.Lock()
+	kept := c.Trunks[:0]
+	removed := false
+	for _, t := range c.Trunks {
+		if strings.EqualFold(t.Session, sessionName) || t.Session == sessionID {
+			removed = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	c.Trunks = kept
+	c.mu.Unlock()
+	if !removed {
+		return nil
+	}
+	return c.Save()
+}
+
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func (c *Config) applyDefaults() error {
@@ -171,10 +334,12 @@ func (c *Config) Find(sessionName, sessionID string) *TrunkConfig {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for i := range c.Trunks {
-		t := &c.Trunks[i]
+		t := c.Trunks[i]
 		if strings.EqualFold(t.Session, sessionName) || t.Session == sessionID {
-			return t
+			return &t
 		}
 	}
 	return nil
