@@ -10,6 +10,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"wacalls/internal/siptrunk"
 )
 
 func main() {
@@ -18,6 +20,7 @@ func main() {
 	staticDir := flag.String("static", "client/dist", "static client directory (optional)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	maxCalls := flag.Int("max-calls-per-session", 8, "max concurrent calls per session (0 = unlimited)")
+	trunksPath := flag.String("trunks", "", "SIP trunk configuration file (JSON); sessions listed there talk to a PBX instead of the browser")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -30,7 +33,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := newServer(ctx, *dbPath, *staticDir, *maxCalls, log)
+	trunks, err := siptrunk.Load(*trunksPath)
+	if err != nil {
+		log.Error("trunk config invalid", "err", err)
+		os.Exit(1)
+	}
+	siptrunk.SetRTPPortRange(trunks.RTPPortStart, trunks.RTPPortEnd)
+	if n := len(trunks.Trunks); n > 0 {
+		log.Info("sip trunks configured", "count", n, "file", *trunksPath)
+	}
+
+	srv, err := newServer(ctx, *dbPath, *staticDir, *maxCalls, trunks, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)
 		os.Exit(1)

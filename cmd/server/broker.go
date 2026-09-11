@@ -40,6 +40,13 @@ type SessionInfo struct {
 	JID    string `json:"jid"`
 	State  string `json:"state"`
 	Paired bool   `json:"paired"`
+	Trunk  *TrunkInfo `json:"trunk,omitempty"`
+}
+
+// TrunkInfo describes the SIP trunk attached to a session, when any.
+type TrunkInfo struct {
+	Enabled    bool `json:"enabled"`
+	Registered bool `json:"registered"`
 }
 
 type subscriber struct {

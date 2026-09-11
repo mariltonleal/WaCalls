@@ -202,7 +202,22 @@ func (m *CallManager) HandleCallAck(ctx context.Context, node *waBinary.Node) {
 		return
 	}
 	if e := wanode.AttrString(node.Attrs, "error"); e != "" {
+		// The server refused the offer (e.g. the number has no WhatsApp).
+		// Without this the call would sit in "ringing" forever.
 		m.log.Error("offer ack error", "error", e)
+		m.mu.Lock()
+		call := m.currentCall
+		if call == nil || call.IsEnded() {
+			m.mu.Unlock()
+			return
+		}
+		_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: core.EndCallReasonFailed})
+		m.emitState()
+		m.mu.Unlock()
+		if m.OnEnded != nil {
+			m.OnEnded(call)
+		}
+		m.cleanupMedia()
 		return
 	}
 	parsed := signaling.ParseRelayFromAck(node)

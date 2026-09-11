@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 
+	"wacalls/internal/siptrunk"
+
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -20,13 +22,14 @@ type SessionManager struct {
 	waLogger  waLog.Logger
 	log       *slog.Logger
 	maxCalls  int
+	trunks    *siptrunk.Config
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
 }
 
-func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
+func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int, trunks *siptrunk.Config) *SessionManager {
 	return &SessionManager{
 		appCtx:    ctx,
 		container: container,
@@ -35,8 +38,23 @@ func newSessionManager(ctx context.Context, container *sqlstore.Container, broke
 		waLogger:  waLogger,
 		log:       log,
 		maxCalls:  maxCalls,
+		trunks:    trunks,
 		sessions:  map[string]*Session{},
 	}
+}
+
+// attachTrunkIfConfigured binds a SIP trunk to the session when trunks.json
+// has an entry for its name or id.
+func (m *SessionManager) attachTrunkIfConfigured(s *Session) {
+	cfg := m.trunks.Find(s.name, s.id)
+	if cfg == nil {
+		return
+	}
+	if err := s.attachTrunk(*cfg); err != nil {
+		m.log.Error("sip trunk start failed", "session", s.id, "name", s.name, "err", err)
+		return
+	}
+	m.log.Info("sip trunk attached", "session", s.id, "name", s.name, "local_port", cfg.LocalPort, "did", cfg.DID)
 }
 
 func (m *SessionManager) register(s *Session) {
@@ -110,6 +128,7 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		client := whatsmeow.NewClient(device, m.waLogger)
 		s := newSession(m, row.ID, row.Name, client)
 		m.register(s)
+		m.attachTrunkIfConfigured(s)
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
 		}
@@ -128,6 +147,7 @@ func (m *SessionManager) Create(name string) (string, error) {
 	client := whatsmeow.NewClient(device, m.waLogger)
 	s := newSession(m, id, name, client)
 	m.register(s)
+	m.attachTrunkIfConfigured(s)
 	m.broker.emitSessionList(m.infos())
 	if err := s.startPairing(m.appCtx); err != nil {
 		m.log.Error("start pairing failed", "session", id, "err", err)
@@ -152,6 +172,7 @@ func (m *SessionManager) Delete(ctx context.Context, id string) error {
 		_ = m.container.DeleteDevice(ctx, s.client.Store)
 	}
 	s.teardownAllCalls()
+	s.detachTrunk()
 	m.unregister(id)
 	_ = m.store.delete(ctx, id)
 	m.broker.emitSessionList(m.infos())

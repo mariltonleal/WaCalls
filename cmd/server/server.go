@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"log/slog"
 
+	"wacalls/internal/siptrunk"
+
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	_ "modernc.org/sqlite"
@@ -27,7 +29,7 @@ func openDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, log *slog.Logger) (*server, error) {
+func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, trunks *siptrunk.Config, log *slog.Logger) (*server, error) {
 	db, err := openDB(dbPath)
 	if err != nil {
 		return nil, err
@@ -47,7 +49,7 @@ func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, log 
 	}
 
 	broker := NewBroker()
-	mgr := newSessionManager(ctx, container, broker, store, waLogger, log, maxCalls)
+	mgr := newSessionManager(ctx, container, broker, store, waLogger, log, maxCalls, trunks)
 	broker.SnapshotFn = mgr.snapshotEvents
 
 	return &server{broker: broker, sessions: mgr, log: log, staticDir: staticDir}, nil

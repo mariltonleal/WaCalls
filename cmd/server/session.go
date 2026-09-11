@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"wacalls/internal/siptrunk"
 	"wacalls/internal/voip/call"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/signaling"
@@ -29,8 +30,14 @@ type Session struct {
 	client *whatsmeow.Client
 	reg    *callRegistry
 
-	mu   sync.Mutex
-	auth AuthSnapshot
+	// trunk, when set, replaces the browser bridge: calls are delivered to
+	// and received from a PBX over SIP.
+	trunk       *siptrunk.Trunk
+	trunkCancel context.CancelFunc
+
+	mu       sync.Mutex
+	auth     AuthSnapshot
+	callerPN map[string]string // callID → caller phone number (incoming calls)
 }
 
 func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) *Session {
@@ -40,11 +47,95 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 		mgr:    mgr,
 		log:    mgr.log.With("session", id),
 		client: client,
-		auth:   AuthSnapshot{State: "connecting"},
-		reg:    newCallRegistry(),
+		auth:     AuthSnapshot{State: "connecting"},
+		reg:      newCallRegistry(),
+		callerPN: map[string]string{},
 	}
 	client.AddEventHandler(s.handleEvent)
 	return s
+}
+
+// attachTrunk starts a SIP trunk for this session. Calls then flow to/from
+// the PBX instead of the browser.
+func (s *Session) attachTrunk(cfg siptrunk.TrunkConfig) error {
+	t, err := siptrunk.New(cfg, s.log)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(s.mgr.appCtx)
+	if err := t.Start(ctx, s); err != nil {
+		cancel()
+		return err
+	}
+	s.trunk = t
+	s.trunkCancel = cancel
+	return nil
+}
+
+func (s *Session) detachTrunk() {
+	if s.trunkCancel != nil {
+		s.trunkCancel()
+		s.trunkCancel = nil
+	}
+	s.trunk = nil
+}
+
+// DialWhatsApp implements siptrunk.Dialer: the PBX asked us to call phone.
+func (s *Session) DialWhatsApp(ctx context.Context, phone string, onCreated func(callID string, cm *call.CallManager)) (string, error) {
+	if s.client.Store.ID == nil {
+		return "", &call.CallError{Msg: "session not paired"}
+	}
+	if max := s.mgr.maxCalls; max > 0 && s.reg.count() >= max {
+		return "", &call.CallError{Msg: "max concurrent calls"}
+	}
+	peer := types.NewJID(phone, types.DefaultUserServer)
+	callID := signaling.GenerateCallID()
+	cm := s.createCall(callID)
+	if onCreated != nil {
+		onCreated(callID, cm)
+	}
+	owner := "sip"
+	s.mgr.broker.upsertCall(CallRecord{
+		SessionID: s.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		StartedAt: time.Now().UnixMilli(), Status: StatusStarting,
+	})
+	if err := cm.StartCall(ctx, callID, peer, false); err != nil {
+		s.removeCall(callID)
+		s.mgr.broker.endCall(callID, string(core.EndCallReasonFailed))
+		return "", err
+	}
+	return callID, nil
+}
+
+func (s *Session) setCallerPN(callID, pn string) {
+	s.mu.Lock()
+	s.callerPN[callID] = pn
+	s.mu.Unlock()
+}
+
+func (s *Session) takeCallerPN(callID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pn := s.callerPN[callID]
+	delete(s.callerPN, callID)
+	return pn
+}
+
+// callerPhone works out the phone number behind an incoming call. WhatsApp
+// may present the caller as a LID (privacy id) instead of a phone JID.
+func (s *Session) callerPhone(ctx context.Context, evt *events.CallOffer) string {
+	if evt.From.Server == types.DefaultUserServer {
+		return evt.From.User
+	}
+	if alt := evt.CallCreatorAlt; !alt.IsEmpty() && alt.Server == types.DefaultUserServer {
+		return alt.User
+	}
+	if s.client.Store != nil && s.client.Store.LIDs != nil {
+		if pn, err := s.client.Store.LIDs.GetPNForLID(ctx, evt.From.ToNonAD()); err == nil && !pn.IsEmpty() {
+			return pn.User
+		}
+	}
+	return ""
 }
 
 func (s *Session) createCall(callID string) *call.CallManager {
@@ -60,9 +151,17 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
 			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 		})
+		if s.trunk != nil {
+			phone := s.takeCallerPN(c.CallID)
+			go s.trunk.OnIncoming(cm, c, phone)
+			return
+		}
 		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid)
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
+		if s.trunk != nil {
+			s.trunk.OnCallState(c.CallID, c)
+		}
 		if c.IsEnded() {
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
@@ -84,10 +183,17 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		s.mgr.broker.upsertCall(rec)
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		if s.trunk != nil {
+			s.trunk.OnCallEnded(c.CallID, c)
+		}
 		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
+		if s.trunk != nil {
+			s.trunk.OnPeerAudio(callID, pcm16)
+			return
+		}
 		ac, ok := s.reg.get(callID)
 		if !ok || ac.bridge == nil {
 			return
@@ -123,6 +229,9 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	if max := s.mgr.maxCalls; max > 0 && s.reg.count() >= max {
 		s.rejectOffer(ctx, node, evt.From)
 		return
+	}
+	if s.trunk != nil {
+		s.setCallerPN(callID, s.callerPhone(ctx, evt))
 	}
 	cm := s.createCall(callID)
 	cm.HandleCallOffer(ctx, node, evt.From)
@@ -225,7 +334,11 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	info := SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	if s.trunk != nil {
+		info.Trunk = &TrunkInfo{Enabled: true, Registered: s.trunk.Registered()}
+	}
+	return info
 }
 
 func (s *Session) setBridge(callID string, b *Bridge) {
@@ -275,6 +388,7 @@ func (s *Session) replaceClient(client *whatsmeow.Client) {
 
 func (s *Session) shutdown() {
 	s.teardownAllCalls()
+	s.detachTrunk()
 	s.client.Disconnect()
 }
 
